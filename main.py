@@ -3,13 +3,15 @@ from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.prompts import (ChatPromptTemplate,SystemMessagePromptTemplate,HumanMessagePromptTemplate)
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableParallel , RunnablePassthrough, RunnableLambda
+from langchain_core.runnables import( RunnableParallel , RunnablePassthrough, RunnableLambda, RunnableBranch)
 import os
 from pydantic import BaseModel
 from typing import Literal
 
 load_dotenv()
 app = FastAPI()
+
+# LangSmith
 os.getenv("LANGCHAIN_TRACING_V2")
 os.getenv("LANGCHAIN_API_KEY")
 
@@ -46,6 +48,45 @@ def analysis(request:ContentRequest):
     # define moedl
     model = ChatGroq(model='openai/gpt-oss-20b',api_key=os.getenv("GROQ_API_KEY"))
     # structured_model = model.with_structured_output(SentimentOutput)
+
+    # define language
+    def detect_language(content):
+      arabic = any(
+        '\u0600' <= char <= '\u06FF'
+        for char in content
+    )
+
+      english = any(
+        ('a' <= char.lower() <= 'z')
+        for char in content
+    )
+
+      if arabic:
+        return "ar"
+      elif english:
+        return "en"
+      else:
+        return "none"
+
+    detect_language_chain = RunnableLambda(detect_language)
+
+    language_detection= RunnablePassthrough.assign(
+       language= detect_language_chain
+    )
+    
+    routing = RunnableBranch(
+       (
+          lambda  x: x['language']=='ar',
+          RunnablePassthrough()
+       ),
+       (
+          lambda  x: x['language']=='en',
+            RunnablePassthrough()
+       ),
+       RunnablePassthrough()
+    )
+
+    routing_chain = language_detection | routing
     # define prompt all task
     prompt_templete = ChatPromptTemplate.from_messages([
        SystemMessagePromptTemplate.from_template("""
@@ -73,15 +114,23 @@ def analysis(request:ContentRequest):
 
     # sentiment
     prompt_templete_sentiment = ChatPromptTemplate.from_messages([
-     SystemMessagePromptTemplate.from_template("""
-      You are a sentiment analysis assistant.
-      Analyze the sentiment of the provided content.
-      Return the sentiment as:
-      Positive, Negative, or Neutral.
-      """),
-     HumanMessagePromptTemplate.from_template('{content}')
-    ])
-
+    SystemMessagePromptTemplate.from_template("""
+    You are a sentiment classification assistant.
+    Classify the sentiment of the content as exactly ONE of these values:
+    Positive
+    Negative
+    Neutral
+    IMPORTANT:
+    - Return ONLY ONE WORD.
+    - Do not explain your answer.
+    - Do not use Markdown.
+    - Do not use **.
+    - Do not add punctuation.
+    - Do not add any extra text.
+    """),
+    HumanMessagePromptTemplate.from_template('{content}')
+]) 
+    
     # topics
     prompt_templete_topics = ChatPromptTemplate.from_messages([
        SystemMessagePromptTemplate.from_template("""
@@ -96,21 +145,20 @@ def analysis(request:ContentRequest):
     parser = StrOutputParser()
 
     #corrention function
-   
     def calc_score(data):
      sentiment = data["analysis"]["sentiment"].strip().lower()
 
-     if sentiment.startswith("**positive"):
-          return 1.0
-     elif sentiment.startswith("**negative"):
-          return 0.0
-     elif sentiment.startswith("**neutral"):
-           return 0.5
+     if sentiment == "positive":
+        return 1.0
+     elif sentiment == "negative":
+        return 0.0
+     elif sentiment == "neutral":
+        return 0.5
      else:
-          return None
-
-
+        return None
+     
     score_cahin = RunnableLambda(calc_score)
+
     # pipline multi models
     chain_summary = prompt_templete_summary | model | parser
     chain_sentiment = prompt_templete_sentiment | model | parser
@@ -124,7 +172,7 @@ def analysis(request:ContentRequest):
         )
 
     #runnable pass through
-    content_analysis_chain = RunnablePassthrough.assign(analysis=parallel_analysis) | RunnablePassthrough.assign(score = score_cahin)
+    content_analysis_chain = routing_chain | RunnablePassthrough.assign(analysis=parallel_analysis) | RunnablePassthrough.assign(score = score_cahin)
 
     result_con = content_analysis_chain.invoke({"content": request.content})
     return {'data':result_con}
